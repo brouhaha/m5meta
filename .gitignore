@@ -1,0 +1,6 @@
+__pycache__
+*~
+build/
+dist/
+tests/
+m5preprocessor.egg-info/
