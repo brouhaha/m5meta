@@ -269,7 +269,7 @@ class M5Meta:
             return self.symtab[s]
         if self.pass_num == 1:
             return 0  # may be a forward reference
-        #raise M5MetaError(f'cannot evaluate "{s}" as a value for field {field_name}')
+        raise M5MetaError(f'cannot evaluate "{s}" as a value for field {field_name}')
         return 0
 
     def add_field(self, fd, fname, fvalue):
