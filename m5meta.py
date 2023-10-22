@@ -63,6 +63,33 @@ def to_camelcase(s: str) -> str:
 class M5MetaError(Exception):
     pass
 
+
+@dataclass
+class M5EnumValue:
+    name:    str
+    value:   TOptional[int]
+
+
+@dataclass
+class M5Enum:
+    name:      TOptional[str] = None
+    values:    Dict[str, M5EnumValue] = dict_field_no_init()
+    max_value: int = 0
+    width:     TOptional[int] = None
+
+    def define_value(self,
+                     name: str,
+                     value: TOptional[int] = None):
+        if name in self.values and self.values[name] is not None:
+            raise M5MetaError(f'duplicate enum name {name}')
+        if value is None:
+            value = self.max_value + 1
+        if self.width is not None and value.bit_length() > self.width:
+            raise M5MetaError(f'enum value {name}={value} wider than enum declared width {self.width}')
+        self.max_value = max(value+1, self.max_value)
+        self.values[name] = M5EnumValue(name, value)
+
+
 @dataclass
 class Field:
     name:     str
@@ -178,7 +205,10 @@ class M5Meta:
 
         self.symtab = {}
         self.spaces = {}
+        self.enums = {}
         self.space = None
+
+        self.anon_number = 0
 
         self.grammar = self.define_grammar()
 
@@ -193,24 +223,32 @@ class M5Meta:
             return d[value]
         raise M5MetaError(f'unknown symbol "{value}" in field enum constant definition')
 
-    def action_field_enum_def(self, x):
-        prev = -1
-        d = {}
-        for i in range(1, len(x)):
-            name = x[i][0]
-            value = x[i][1]
-            if name in d:
-                raise M5MetaError(f'multiply defined field enum constant "{name}"')
-            if value is None:
-                value = prev + 1
-            prev = value
-            d[name] = self.process_enum_value(d, value)
-        return {'enum': d}
+    def action_enum_item(self, x):
+        if not hasattr(self, 'enum_being_defined'):
+            self.enum_being_defined = M5Enum()
+        name = x[0]
+        value = x[1] if len(x) > 1 else None
+        self.enum_being_defined.define_value(name, value)
 
-    def action_field_bool(self, x):
-        d = { 'false': 0, 'true': 1 }
-        return {'width': 1,
-                'enum': d }
+    def action_enum_width_attribute(self, x):
+        width = x[1]
+        if not hasattr(self, 'enum_being_defined'):
+            self.enum_being_defined = M5Enum()
+        if (self.enum_being_defined.width is not None and
+            width != self.enum_being_defined.width):
+            raise M5MetaError('multiple width attributes on enum')
+        self.enum_being_defined.width = width
+        return width
+
+    def action_enum_def(self, x):
+        name = x[1]
+        if name is None:
+            raise M5MetaError('anonymous enum definition not embedded')
+            #name = '___enum_' + str(self.anon_number)
+            #self.anon_number += 1
+        self.enum_being_defined.name = name
+        self.enums[name] = self.enum_being_defined
+        delattr(self, 'enum_being_defined')
 
     def action_field_def(self, x):
         name = x[0]
@@ -288,6 +326,8 @@ class M5Meta:
         for fa in x:
             if type(fa) is str:
                 # macro invocation
+                if self.space is None:
+                    raise M5MetaError(f'undefined space, so no macro {fa}')
                 if fa not in self.space.macros:
                     raise M5MetaError(f'undefined macro {fa}')
                 for mfn, mfv in self.space.macros[fa].items():
@@ -350,8 +390,8 @@ class M5Meta:
         return r
 
     def define_grammar(self):
-        dec_int = Word(nums).setParseAction(lambda toks: int(toks[0]))
-        hex_int = Regex('0[xX][0-9a-fA-F]*').setParseAction(lambda toks: int(toks[0][2:],16))
+        dec_int = Word(nums).set_parse_action(lambda toks: int(toks[0]))
+        hex_int = Regex('0[xX][0-9a-fA-F]*').set_parse_action(lambda toks: int(toks[0][2:],16))
 
         # hexadecimal must precede decimal, or decimal will grab the leading
         # '0' out of the '0x' prefix of a hexadecimal constant
@@ -363,11 +403,12 @@ class M5Meta:
         COLON  = literal_suppress(':')
         COMMA  = literal_suppress(',')
         EQUALS = literal_suppress('=')
+        LPAREN = literal_suppress('(')
+        RPAREN = literal_suppress(')')
         LBRACE = literal_suppress('{')
         RBRACE = literal_suppress('}')
         SEMI   = literal_suppress(';')
 
-        BOOL     = Keyword('bool')
         DEFAULT  = Keyword('default')
         ENUM     = Keyword('enum')
         EQUATE   = Keyword('equate')
@@ -377,91 +418,109 @@ class M5Meta:
         ORIGIN   = Keyword('origin')
         SIZE     = Keyword('size')
         SPACE    = Keyword('space')
+        STRUCT   = Keyword('struct')
+        UNION    = Keyword('union')
         WIDTH    = Keyword('width')
 
         value = ident | integer
 
-        field_bool_attribute = BOOL
-        field_bool_attribute.setParseAction(self.action_field_bool)
-
-        field_enum_item = ident + Optional(EQUALS + value)
-        field_enum_item.setParseAction(lambda x: [[x[0], x[1] if len(x) > 1 else None]])
-
         field_assignment = ident + ARROW + value
-        field_assignment.setParseAction(lambda x: [[x[0], x[1]]])
+        field_assignment.set_parse_action(lambda x: [[x[0], x[1]]])
 
         macro_subst = ident
-        macro_subst.setParseAction(lambda x: [x[0]])
+        macro_subst.set_parse_action(lambda x: [x[0]])
         
         instruction_part = field_assignment | macro_subst
 
         instruction = separated_list(instruction_part, COMMA)
-        instruction.setParseAction(self.action_instruction)
+        instruction.set_parse_action(self.action_instruction)
 
         label = ident + COLON
-        label.setParseAction(lambda x: [x[0]])
+        label.set_parse_action(lambda x: [x[0]])
 
         labels = ZeroOrMore(label)
 
         l_instruction = labels + instruction
-        l_instruction.setParseAction(self.action_l_instruction)
+        l_instruction.set_parse_action(self.action_l_instruction)
 
         macro_def = MACRO + ident + COLON + LBRACE + instruction + RBRACE
-        macro_def.setParseAction(self.action_macro_def)
+        macro_def.set_parse_action(self.action_macro_def)
 
-        field_enum_def = ENUM + LBRACE + separated_list(field_enum_item, SEMI, allow_term_sep = True) + RBRACE
-        field_enum_def.setParseAction(self.action_field_enum_def)
+        enum_item = ident + Optional(EQUALS + value)
+        enum_item.set_parse_action(self.action_enum_item)
+
+        enum_items = separated_list(enum_item,
+                                    SEMI,
+                                    allow_term_sep = True)
+
+        enum_item_list = LBRACE + enum_items + RBRACE
+
+        enum_width_attribute = WIDTH + value
+        enum_width_attribute.set_parse_action(self.action_enum_width_attribute)
+
+        enum_attribute = enum_width_attribute
+
+        enum_attributes = LPAREN + separated_list(enum_attribute, COMMA, allow_term_sep = False) + RPAREN
+
+        enum_def = ENUM + Optional(ident, None) + Optional(enum_attributes, None) + enum_item_list
+        enum_def.set_parse_action(self.action_enum_def)
 
         field_origin_attribute = ORIGIN + value
-        field_origin_attribute.setParseAction(lambda x: {'origin': x[1]})
+        field_origin_attribute.set_parse_action(lambda x: {'origin': x[1]})
 
         field_width_attribute = WIDTH + value
-        field_width_attribute.setParseAction(lambda x: {'width': x[1]})
+        field_width_attribute.set_parse_action(lambda x: {'width': x[1]})
 
         field_default = DEFAULT + value
-        field_default.setParseAction(lambda x: {'default': x[1]})
+        field_default.set_parse_action(lambda x: {'default': x[1]})
 
-        field_attribute = field_origin_attribute | field_width_attribute | field_enum_def | field_bool_attribute | field_default
+        field_attribute = field_origin_attribute | field_width_attribute | enum_def | field_default
 
         field_attributes = separated_list(field_attribute, COMMA)
-        field_attributes.setParseAction(self.action_merge_dicts)
+        field_attributes.set_parse_action(self.action_merge_dicts)
 
         field_def = ident + COLON + field_attributes
-        field_def.setParseAction(self.action_field_def)
+        field_def.set_parse_action(self.action_field_def)
 
         address_spaces = separated_list(ident, ',')
-        address_spaces.setParseAction(lambda x: [x])
+        address_spaces.set_parse_action(lambda x: [x])
 
         field_defs = FIELDS + address_spaces + COLON + LBRACE + separated_list(field_def, SEMI, allow_term_sep = True) + RBRACE
-        field_defs.setParseAction(self.action_field_defs)
+        field_defs.set_parse_action(self.action_field_defs)
+
+        struct_def = STRUCT + ident + COLON + LBRACE + separated_list(field_def, SEMI, allow_term_sep = True) + RBRACE
+
+        union_def = UNION + ident + COLON + LBRACE + separated_list(field_def, SEMI, allow_term_sep = True) + RBRACE
 
         space_size_attribute = SIZE + value
-        space_size_attribute.setParseAction(lambda x: { 'size': x[1] })
+        space_size_attribute.set_parse_action(lambda x: { 'size': x[1] })
 
         space_width_attribute = WIDTH + value
-        space_width_attribute.setParseAction(lambda x: { 'width': x[1] })
+        space_width_attribute.set_parse_action(lambda x: { 'width': x[1] })
 
         space_attribute = space_size_attribute | space_width_attribute
 
         space_attributes = separated_list(space_attribute, COMMA)
-        space_attributes.setParseAction(self.action_merge_dicts)
+        space_attributes.set_parse_action(self.action_merge_dicts)
 
         space_def = SPACE + ident + COLON + space_attributes
-        space_def.setParseAction(self.action_space_def)
+        space_def.set_parse_action(self.action_space_def)
 
         space_select = SPACE + ident
-        space_select.setParseAction(self.action_space_select)
+        space_select.set_parse_action(self.action_space_select)
 
         equate = ident + EQUATE + value
 
         origin = ORIGIN + value
-        origin.setParseAction(self.action_origin)
+        origin.set_parse_action(self.action_origin)
 
         statement_list = Forward()
 
         if_statement = IF + value + LBRACE + statement_list + RBRACE
 
-        statement = space_def | field_defs | space_select | macro_def | equate | origin | if_statement | l_instruction
+        def_statement = space_def | field_defs | enum_def | struct_def | union_def
+
+        statement = def_statement | space_select | macro_def | equate | origin | if_statement | l_instruction
 
         statement_list <<= separated_list(statement, ';', allow_term_sep = True)
 
@@ -470,7 +529,7 @@ class M5Meta:
         compilation_unit = statement_list
         compilation_unit.ignore(comment)
 
-        #field_def.setParseAction(partial(self.print_production, 'field_def'))
+        #field_def.set_parse_action(partial(self.print_production, 'field_def'))
 
         return compilation_unit
 
@@ -517,10 +576,14 @@ class M5Meta:
                  listf: TOptional[TextIO] = None):
         listing_file = listf
         self.src = M5Pre(self.src_file).read()
-        for p in range(1, len(self.passes)):
-            print(f'pass {p}')
-            self.pass_num = p
-            self.passes[p](self)
+        try:
+            for p in range(1, len(self.passes)):
+                print(f'pass {p}')
+                self.pass_num = p
+                self.passes[p](self)
+        except M5MetaError as e:
+            print(f'Error: {e}')
+            return
         if listf is not None:
             self.write_listing_file()
 
