@@ -89,6 +89,13 @@ class M5Enum:
         self.max_value = max(value+1, self.max_value)
         self.values[name] = M5EnumValue(name, value)
 
+    def assign_width(self):
+        if self.width is not None:
+            return
+        self.width = 0
+        for n, v in self.values.items():
+            self.width = max(self.width, v.value.bit_length())
+
 
 @dataclass
 class Field:
@@ -247,6 +254,7 @@ class M5Meta:
             #name = '___enum_' + str(self.anon_number)
             #self.anon_number += 1
         self.enum_being_defined.name = name
+        self.enum_being_defined.assign_width()
         self.enums[name] = self.enum_being_defined
         delattr(self, 'enum_being_defined')
 
