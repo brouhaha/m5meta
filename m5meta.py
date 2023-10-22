@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 # m5meta: Meta assembler
-# Copyright 2019 Eric Smith <spacewar@gmail.com>
+# Copyright 2023 Eric Smith <spacewar@gmail.com>
 # SPDX-License-Identifier: GPL-3.0
 
 # This program is free software: you can redistribute it and/or modify
@@ -65,14 +65,25 @@ class M5MetaError(Exception):
 
 
 @dataclass
+class M5Type:
+    name:    TOptional[str] = None
+    width:   TOptional[int] = None
+    origin:  TOptional[int] = None
+
+
+@dataclass
+class M5Integer(M5Type):
+    pass
+
+
+@dataclass
 class M5EnumValue:
     name:    str
     value:   TOptional[int]
 
 
 @dataclass
-class M5Enum:
-    name:      TOptional[str] = None
+class M5Enum(M5Type):
     values:    Dict[str, M5EnumValue] = dict_field_no_init()
     max_value: int = 0
     width:     TOptional[int] = None
@@ -96,40 +107,35 @@ class M5Enum:
         for n, v in self.values.items():
             self.width = max(self.width, v.value.bit_length())
 
+    def __eq__(self, other):
+        if (self.name != other.name or
+            self.max_value != other.max_value or
+            self.width != other.width or
+            len(self.values) != len(other.values)):
+            print(f'{self=}')
+            print(f'{other=}')
+            return False
+        for n, v in self.values.items():
+            if (n not in other.values or
+                self.values[n] != other.values[n]):
+                print(f'{self=}')
+                print(f'{other=}')
+                return False
+        return True
+
 
 @dataclass
-class Field:
-    name:     str
-    origin:   TOptional[int] = None
-    width:    TOptional[int] = None
-    enum:     TOptional[Dict[str, int]] = None
-    default:  TOptional[int] = None
-    stats:    TOptional[Dict[int, int]] = dataclasses.field(default_factory=Counter, init = False, repr = False)
-    enum_rev: TOptional[Dict[int, str]] = dict_field_no_init(repr = False)
+class M5Struct(M5Type):
+    union:    bool = False
+    fields:   Dict[str, M5Type] = dict_field_no_init()
 
-    def write_fdef(self, f):
-        f.write(f'field {self.name} lsb {self.origin} width {self.width}')
-        if self.enum is not None:
-            f.write(' enum')
-        f.write('\n')
-        if self.enum is not None:
-            for n, v in self.enum.items():
-                f.write(f'  {n} = {v}\n')
-            f.write('end\n')
-    
-    def write_vhdl(self, f):
-        f.write(f'  subtype {self.name}_t is std_logic_vector({self.width-1} downto 0);\n')
-        if self.enum is not None:
-            for n, v in self.enum.items():
-                f.write(f'  constant {self.name}_{n}: {self.name}_t := "{v:0{self.width}b}";\n')
-        f.write('\n')
 
 @dataclass
 class AddressSpace:
     name:     str
-    size:     TOptional[int] = None
     width:    TOptional[int] = None
-    fields:   Dict[str, Field] = dict_field_no_init()
+    depth:    TOptional[int] = None
+    struct:   TOptional[M5Struct] = None
     macros:   Dict[str, Dict] = dict_field_no_init()
     bits:     bytearray = dataclasses.field(default_factory = bytearray, init = False)
     pc:       int = dataclasses.field(default = 0, init = False)
@@ -148,17 +154,16 @@ class AddressSpace:
         return origin
 
     def instruction_to_object(self, addr, instruction):
-        #debug = self.name.startswith('dispatch')
         inst = 0
-        for fn, fd in self.fields.items():
+        for fn, ft in self.struct.fields:
             if fn in instruction:
                 fv = instruction[fn]
-            elif fd.default is not None:
-                fv = fd.default
+            elif self.struct.fields[fn].default is not None:
+                fv = self.struct.fields[fn].default
             else:
                 raise M5MetaError('unassigned field {fn} at address {addr:04x}')
-            fd.stats[fv] += 1
-            inst |= (fv << fd.origin)
+            #fd.stats[fv] += 1
+            inst |= (fv << ft.origin)
         return inst
 
     def generate_object(self):
@@ -176,12 +181,6 @@ class AddressSpace:
                 hex = '.format('
                 print(f'{data:0{hex_digits}x}', file = f)
                 prev_addr = addr
-
-    def write_fdef(self, f):
-        f.write(f'word width {self.width}\n')
-        for fd in self.fields.values():
-            f.write('\n')
-            fd.write_fdef(f)
 
     def write_vhdl(self, f, name):
         f.write('library ieee;\n')
@@ -202,6 +201,7 @@ class AddressSpace:
 
         f.write(f'end package {name}_package;\n')
 
+
 class M5Meta:
     def __init__(self, src_file, obj_base_fn):
 
@@ -212,7 +212,11 @@ class M5Meta:
 
         self.symtab = {}
         self.spaces = {}
-        self.enums = {}
+
+        self.types = {}
+        self.type_being_defined = None
+        self.type_being_defined_stack = []
+
         self.space = None
 
         self.anon_number = 0
@@ -230,6 +234,22 @@ class M5Meta:
             return d[value]
         raise M5MetaError(f'unknown symbol "{value}" in field enum constant definition')
 
+    def action_width_attribute(self, x):
+        print(f'action_width_attribute {x=}')
+        return { 'width': x[1] }
+
+    def action_default_attribute(self, x):
+        print(f'action_default_attribute {x=}')
+        return { 'default': x[1] }
+
+    def action_depth_attribute(self, x):
+        print(f'action_depth_attribute {x=}')
+        return { 'depth': x[1] }
+
+    def action_origin_attribute(self, x):
+        print(f'action_origin_attribute {x=}')
+        return { 'origin': x[1] }
+
     def action_enum_item(self, x):
         if not hasattr(self, 'enum_being_defined'):
             self.enum_being_defined = M5Enum()
@@ -238,6 +258,7 @@ class M5Meta:
         self.enum_being_defined.define_value(name, value)
 
     def action_enum_width_attribute(self, x):
+        # XXX this now has to be done differently!
         width = x[1]
         if not hasattr(self, 'enum_being_defined'):
             self.enum_being_defined = M5Enum()
@@ -255,51 +276,53 @@ class M5Meta:
             #self.anon_number += 1
         self.enum_being_defined.name = name
         self.enum_being_defined.assign_width()
-        self.enums[name] = self.enum_being_defined
+        if name in self.types and self.enum_being_defined != self.types[name]:
+            raise M5MetaError(f'type name "{name}" redefined')
+        self.types[name] = self.enum_being_defined
         delattr(self, 'enum_being_defined')
 
-    def action_field_def(self, x):
-        name = x[0]
-        field = Field(name)
-        for k, v in x[1].items():
-            setattr(field, k, v)
-        if field.default is not None and type(field.default) is str:
-            if field.enum is None:
-                de = field.default
-                raise M5MetaError(f'no definition for default "{de}"')
-            else:
-                field.default = self.process_enum_value(field.enum, field.default)
-        max_value = None
-        if field.enum is not None:
-            max_value = max(field.enum.values())
-        if field.default is not None:
-            if max_value is None:
-                max_value = field.default
-            else:
-                max_value = max(max_value, field.default)
-        if field.width is None:
-            if max_value is None:
-                raise M5MetaError(f'field width not specified and cannot be inferred')
-            field.width = max_value.bit_length()
-        elif max_value is not None and field.width < max_value.bit_length():
-            raise M5MetaError(f"field {name} width {field.width} isn't wide enough for enum or default values")
-        return field
+    def action_type_integer(self, x):
+        print(f'action_type_integer {x=}')
 
-    def action_field_defs(self, x):
-        for space_name in x[1]:
-            if space_name not in self.spaces:
-                raise M5MetaError(f'unknown address space {space_name}')
-            space = self.spaces[space_name]
-            for field_def in x[2:]:
-                field_name = field_def.name
-                if self.pass_num == 1:
-                    if field_name in space.fields:
-                        raise M5MetaError(f'multiply defined field {field_name} in address space {space_name}')
-                    field_def.origin = space.assign_bits(field_def.width, field_def.origin)
-                    space.fields[field_name] = field_def
-                elif self.pass_num == 2:
-                    field = space.fields[field_name]
-                    field.default = field_def.default
+    def action_type_enum(self, x):
+        print(f'action_type_enum {x=}')
+
+    def action_type_struct(self, x):
+        print(f'action_type_struct {x=}')
+
+    def action_type_named(self, x):
+        print(f'action_type_named {x=}')
+
+    def action_item_type(self, x):
+        print(f'action_item_type {x=}')
+
+    def action_item_named(self, x):
+        print(f'action_item_named {x=}')
+
+    def action_struct_or_union(self, x):
+        print(f'action_struct_or_union {x=}')
+        if self.type_being_defined:
+            self.type_being_defined_stack.append(self.type_being_defined)
+        self.type_being_defined = M5Struct(name = None,
+                                           union = x[0] == 'union')
+
+    def action_struct_def(self, x):
+        print(f'action_struct_def {x=}')
+        name = x[1]
+
+        # XXX should check for duplicate definition
+        if name:
+            self.types[name] = self.type_being_defined
+            result = name
+        else:
+            result = self.type_being_defined
+
+        self.type_being_defined = None
+        if len(self.type_being_defined_stack):
+            self.type_being_defined = self.type_being_defined_stack.pop()
+
+        return result
+        
 
     def action_macro_def(self, x):
         name = x[1]
@@ -319,16 +342,6 @@ class M5Meta:
         raise M5MetaError(f'cannot evaluate "{s}" as a value for field {field_name}')
         return 0
 
-    def add_field(self, fd, fname, fvalue):
-        if fname in fd:
-            raise M5MetaError(f'field {fname} multiply used in instruction')
-        if fname not in self.space.fields:
-            raise M5MetaError(f'field {fname} not defined')
-        field = self.space.fields[fname]
-        if type(fvalue) is str:
-            fvalue = self.eval_symbol(fvalue, fname)
-        fd[fname] = fvalue
-
     def action_instruction(self, x):
         fd = { }
         for fa in x:
@@ -338,11 +351,12 @@ class M5Meta:
                     raise M5MetaError(f'undefined space, so no macro {fa}')
                 if fa not in self.space.macros:
                     raise M5MetaError(f'undefined macro {fa}')
-                for mfn, mfv in self.space.macros[fa].items():
-                    self.add_field(fd, mfn, mfv)
+                #for mfn, mfv in self.space.macros[fa].items():
+                #    self.add_field(fd, mfn, mfv)
             else:
                 # field assignment
-                self.add_field(fd, fa[0], fa[1])
+                #self.add_field(fd, fa[0], fa[1])
+                pass
         return [fd]
 
     def action_l_instruction(self, x):
@@ -361,35 +375,51 @@ class M5Meta:
             self.space.inst[self.space.pc] = fields
         self.space.pc += 1
 
-    def action_origin(self, x):
+    def action_origin_statement(self, x):
         self.space.pc = x[1]
 
+    @staticmethod
+    def get_attrs(attrs, attr_names):
+        results = []
+        for n in attr_names:
+            try:
+                results.append(attrs[n])
+            except:
+                raise M5MetaError(f'missing required attribute {n}')
+        for n in attrs.keys():
+            if n not in attr_names:
+                raise M5MetaError(f'inappropriate attribute {n}')
+        return results
+        
     def action_space_def(self, x):
-        name = x[1]
-        attrs = x[2]
-        try:
-            size = attrs['size']
-        except:
-            raise M5MetaError(f'no size specified for address space "{name}"')
-        try:
-            width = attrs['width']
-        except:
-            raise M5MetaError(f'no width specified for address space "{name}"')
+        attrs = x[1]
+        struct = x[2]
+        name = x[3]
+        print(f'action_space_def {attrs=}')
+        print(f'action_space_def {struct=}')
+        print(f'action_space_def {name=}')
+        width, depth = self.get_attrs(attrs, ['width', 'depth'])
+        if isinstance(struct, str):
+            try:
+                struct = self.types[struct]
+            except:
+                raise M5MetaError(f'type "{struct}" is undefined')
         if self.pass_num == 1:
             if name in self.spaces:
                 raise M5MetaError(f'multiply defined address space "{name}"')
-            self.space = AddressSpace(name, size, width)
-            self.spaces[name] = self.space
+            self.spaces[name] = AddressSpace(name, width, depth, struct)
         else:
             if name not in self.spaces:
                 raise M5MetaError(f'undefined address space "{name}"')
-            self.space = self.spaces[name]
+            # XXX compare address space
 
-    def action_space_select(self, x):
+    def action_space_ident(self, x):
+        print(f'action_space_content {x=}')
         name = x[1]
-        if name not in self.spaces:
-            raise M5MetaError(f'undefined address space {name}')
-        self.space = self.spaces[name]
+        try:
+            self.space = self.spaces[name]
+        except:
+            raise M5MetaError(f'undefined address space "{name}"')
 
     def action_merge_dicts(self, x):
         r = { }
@@ -418,16 +448,18 @@ class M5Meta:
         SEMI   = literal_suppress(';')
 
         DEFAULT  = Keyword('default')
+        DEPTH    = Keyword('depth')
         ENUM     = Keyword('enum')
         EQUATE   = Keyword('equate')
         FIELDS   = Keyword('fields')
         IF       = Keyword('if')
+        INTEGER  = Keyword('integer')
         MACRO    = Keyword('macro')
         ORIGIN   = Keyword('origin')
-        SIZE     = Keyword('size')
         SPACE    = Keyword('space')
         STRUCT   = Keyword('struct')
         UNION    = Keyword('union')
+        UNSIGNED = Keyword('unsigned')
         WIDTH    = Keyword('width')
 
         value = ident | integer
@@ -454,87 +486,101 @@ class M5Meta:
         macro_def = MACRO + ident + COLON + LBRACE + instruction + RBRACE
         macro_def.set_parse_action(self.action_macro_def)
 
+
+        depth_attribute = DEPTH + value
+        depth_attribute.set_parse_action(self.action_depth_attribute)
+        
+        default_attribute = DEFAULT + value
+        default_attribute.set_parse_action(self.action_default_attribute)
+        
+        width_attribute = WIDTH + value
+#        width_attribute = Optional(WIDTH, None) + value
+        width_attribute.set_parse_action(self.action_width_attribute)
+
+        origin_attribute = ORIGIN + value
+        origin_attribute.set_parse_action(self.action_origin_attribute)
+
+        attribute = depth_attribute | default_attribute | width_attribute | origin_attribute
+
+        attributes = LPAREN + separated_list(attribute,
+                                             COMMA,
+                                             allow_term_sep = False) + RPAREN
+        attributes.set_parse_action(self.action_merge_dicts)
+
         enum_item = ident + Optional(EQUALS + value)
         enum_item.set_parse_action(self.action_enum_item)
 
-        enum_items = separated_list(enum_item,
-                                    SEMI,
-                                    allow_term_sep = True)
+        enum_item_list = LBRACE + separated_list(enum_item,
+                                                 SEMI,
+                                                 allow_term_sep = True) + RBRACE
 
-        enum_item_list = LBRACE + enum_items + RBRACE
-
-        enum_width_attribute = WIDTH + value
-        enum_width_attribute.set_parse_action(self.action_enum_width_attribute)
-
-        enum_attribute = enum_width_attribute
-
-        enum_attributes = LPAREN + separated_list(enum_attribute, COMMA, allow_term_sep = False) + RPAREN
-
-        enum_def = ENUM + Optional(ident, None) + Optional(enum_attributes, None) + enum_item_list
+        enum_def = ENUM + Optional(ident, None) + Optional(attributes, None) + enum_item_list
         enum_def.set_parse_action(self.action_enum_def)
 
-        field_origin_attribute = ORIGIN + value
-        field_origin_attribute.set_parse_action(lambda x: {'origin': x[1]})
 
-        field_width_attribute = WIDTH + value
-        field_width_attribute.set_parse_action(lambda x: {'width': x[1]})
+        signed_integer_type = INTEGER
 
-        field_default = DEFAULT + value
-        field_default.set_parse_action(lambda x: {'default': x[1]})
+        unsigned_integer_type = UNSIGNED + Optional(INTEGER)
 
-        field_attribute = field_origin_attribute | field_width_attribute | enum_def | field_default
+        integer_type = signed_integer_type | unsigned_integer_type
 
-        field_attributes = separated_list(field_attribute, COMMA)
-        field_attributes.set_parse_action(self.action_merge_dicts)
+        type_integer = integer_type
+        type_integer.set_parse_action(self.action_type_integer)
 
-        field_def = ident + COLON + field_attributes
-        field_def.set_parse_action(self.action_field_def)
 
-        address_spaces = separated_list(ident, ',')
-        address_spaces.set_parse_action(lambda x: [x])
+        type_enum = enum_def
 
-        field_defs = FIELDS + address_spaces + COLON + LBRACE + separated_list(field_def, SEMI, allow_term_sep = True) + RBRACE
-        field_defs.set_parse_action(self.action_field_defs)
+        struct_def = Forward()
+        type_struct = struct_def
 
-        struct_def = STRUCT + ident + COLON + LBRACE + separated_list(field_def, SEMI, allow_term_sep = True) + RBRACE
+        type_named = ident
 
-        union_def = UNION + ident + COLON + LBRACE + separated_list(field_def, SEMI, allow_term_sep = True) + RBRACE
+        item_type = type_integer | type_enum | type_struct | type_named
+        item_type.set_parse_action(self.action_item_type)
 
-        space_size_attribute = SIZE + value
-        space_size_attribute.set_parse_action(lambda x: { 'size': x[1] })
+        item_named = item_type + Optional(attributes, None) + ident
+        item_named.set_parse_action(self.action_item_named)
 
-        space_width_attribute = WIDTH + value
-        space_width_attribute.set_parse_action(lambda x: { 'width': x[1] })
+        item_list = LBRACE + separated_list(item_named,
+                                            SEMI,
+                                            allow_term_sep = True) + RBRACE
 
-        space_attribute = space_size_attribute | space_width_attribute
+        struct_or_union = ( STRUCT | UNION )
+        struct_or_union.set_parse_action(self.action_struct_or_union)
 
-        space_attributes = separated_list(space_attribute, COMMA)
-        space_attributes.set_parse_action(self.action_merge_dicts)
+        struct_def = struct_or_union + Optional(ident, None) + Optional(attributes, None) + item_list
+        struct_def.set_parse_action(self.action_struct_def)
 
-        space_def = SPACE + ident + COLON + space_attributes
+        space_def = SPACE + Optional(attributes, None) + (struct_def | ident) + ident
         space_def.set_parse_action(self.action_space_def)
 
-        space_select = SPACE + ident
-        space_select.set_parse_action(self.action_space_select)
+        equate_statement = ident + EQUATE + value
 
-        equate = ident + EQUATE + value
+        origin_statement = ORIGIN + value
+        origin_statement.set_parse_action(self.action_origin_statement)
 
-        origin = ORIGIN + value
-        origin.set_parse_action(self.action_origin)
+        space_statement_list = Forward()
 
-        statement_list = Forward()
+        if_statement = IF + value + LBRACE + space_statement_list + RBRACE
 
-        if_statement = IF + value + LBRACE + statement_list + RBRACE
+        space_statement = equate_statement | origin_statement | if_statement | l_instruction
 
-        def_statement = space_def | field_defs | enum_def | struct_def | union_def
+        space_statements = LBRACE + separated_list(space_statement,
+                                                   SEMI,
+                                                   allow_term_sep = True) + RBRACE
 
-        statement = def_statement | space_select | macro_def | equate | origin | if_statement | l_instruction
+        space_ident = SPACE + ident
+        space_ident.set_parse_action(self.action_space_ident)
 
-        statement_list <<= separated_list(statement, ';', allow_term_sep = True)
+        space_content = space_ident + space_statements
+
+        def_statement = space_def | enum_def | struct_def | macro_def | space_content
+
+        def_statement_list = separated_list(def_statement, ';', allow_term_sep = True)
 
         comment = Literal('//') + Optional(restOfLine)
 
-        compilation_unit = statement_list
+        compilation_unit = def_statement_list
         compilation_unit.ignore(comment)
 
         #field_def.set_parse_action(partial(self.print_production, 'field_def'))
@@ -568,8 +614,6 @@ class M5Meta:
         for name, space in self.spaces.items():
             space.generate_object()
             space.write_hex_file(self.obj_base_fn + '_' + space.name + '.hex')
-            with open(self.obj_base_fn + '_' + space.name + '.fdef', 'w') as f:
-                space.write_fdef(f)
             if False:
                 with open(self.obj_base_fn + '_' + space.name + '.vhdl', 'w') as f:
                     space.write_vhdl(f, name)
