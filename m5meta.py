@@ -31,6 +31,7 @@ import json
 import sys
 from typing import Optional as TOptional # Optional conflicts with pyparsing
 from typing import Dict
+from typing import TextIO
 
 import pyparsing
 from pyparsing import alphas, alphanums, \
@@ -512,27 +513,38 @@ class M5Meta:
               pass12,
               pass3]
 
-    def assemble(self):
+    def assemble(self,
+                 listf: TOptional[TextIO] = None):
+        listing_file = listf
         self.src = M5Pre(self.src_file).read()
         for p in range(1, len(self.passes)):
             print(f'pass {p}')
             self.pass_num = p
             self.passes[p](self)
+        if listf is not None:
+            self.write_listing_file()
 
 
 def main():
     parser = argparse.ArgumentParser(description = 'Microcode assembler')
+
     parser.add_argument('asmfile',
                         type = argparse.FileType('r'),
                         help = 'microcode assembler source file')
 
+    parser.add_argument('-l', '--list',
+                        type = argparse.FileType('w'),
+                        help = 'listing file')
+
     args = parser.parse_args()
+
     if args.asmfile.name.endswith('.m5'):
         obj_base_fn = args.asmfile.name[:-3]
     else:
         obj_base_fn = args.asmfile.name
     m5meta = M5Meta(args.asmfile, obj_base_fn = obj_base_fn)
-    m5meta.assemble()
+    m5meta.assemble(args.list)
+        
 
 
 if __name__ == '__main__':
