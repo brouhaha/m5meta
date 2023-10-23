@@ -16,6 +16,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+# Python 3.11 is required
+
 __version__ = '1.0.4'
 __author__ = 'Eric Smith <spacewar@gmail.com>'
 
@@ -23,15 +25,15 @@ __all__ = ['__version__', '__author__',
            'M5Meta', 'M5MetaError']
 
 import argparse
-from collections import Counter, OrderedDict
+import copy
 import dataclasses
 from dataclasses import dataclass
 from functools import partial
 import json
 import sys
-from typing import Optional as TOptional # Optional conflicts with pyparsing
-from typing import Dict
-from typing import TextIO
+from typing import (Optional as TOptional,   # Optional conflicts with pyparsing
+                    Self,
+                    TextIO)
 
 import pyparsing
 from pyparsing import alphas, alphanums, \
@@ -39,6 +41,25 @@ from pyparsing import alphas, alphanums, \
     Forward, Keyword, Literal, Optional, Regex, Word, ZeroOrMore
 
 from m5pre import M5Pre
+
+
+def is_set_or_dict(obj):
+    return type(obj) in frozenset([set, frozenset, dict])
+
+
+make_set_dict = { set:           (lambda x: x),
+                  frozenset:     (lambda x: x),
+                  dict:          (lambda x: set(x.keys()))
+                 }
+def make_set(obj):
+    return make_set_dict.get(type(obj), (lambda x: set([x])))(obj)
+
+def merge_dicts(self,
+                ld: list[dict]):
+    r = { }
+    for d in ld:
+        r.update(d)  # XXX doesn't complain about duplicates
+    return r
 
 
 def separated_list(base, separator, allow_term_sep = False):
@@ -52,12 +73,29 @@ def separated_list(base, separator, allow_term_sep = False):
 def literal_suppress(s: str):
     return Literal(s).suppress()
 
+
+class DictDeepCompare:
+    def __init__(self, dict = None, /, **kwargs):
+        UserDict.__init__(self, dict = dict, **kwargs)
+
+        
+
 def dict_field_no_init(repr = True):
     return dataclasses.field(default_factory = dict, init = False, repr = repr)
 
 
-def to_camelcase(s: str) -> str:
-    return ''.join([x.capitalize() for x in s.split('_')])
+def get_attrs(attrs, attr_names):
+    if attrs is None:
+        attrs = { }
+    print(f'get_attrs {attrs=} {attr_names=}')
+    results = [None] * len(attr_names)
+    for i in range(len(attr_names)):
+        if attr_names[i] in attrs:
+            results[i] = attrs[attr_names[i]]
+    for n in attrs.keys():
+        if n not in attr_names:
+            raise M5MetaError(f'inappropriate attribute {n}')
+    return results
 
 
 class M5MetaError(Exception):
@@ -66,81 +104,168 @@ class M5MetaError(Exception):
 
 @dataclass
 class M5Type:
-    name:    TOptional[str] = None
-    width:   TOptional[int] = None
-    origin:  TOptional[int] = None
+    # these are not applicable for symbol table root
+    name:     TOptional[str] = None  
+    width:    TOptional[int] = None
+    origin:   TOptional[int] = None
+
+    def __post_init__(self):
+        self.__data = {}
+
+    def __len__(self):
+        return len(self.__data)
+
+    def __getitem__(self, key):
+        if key in self.__data:
+            return self.__data[key]
+        raise KeyError(key)
+
+    def __setitem__(self, key, item):
+        self.__data[key] = item
+
+    def __delitem__(self, key):
+        del self.__data[key]
+
+    def __iter__(self):
+        return iter(self.__data)
+
+    def __contains__(self, key):
+        return key in self.__data
+
+    def get(self, key, default=None):
+        if key in self.__data:
+            return self.__data[key]
+        return default
+
+    # for deep comparison
+    def __eq__(self, other):
+        if len(self) != len(other):
+            return False
+        if sorted(self.keys()) != sorted(other.keys()):
+            return False
+        for n, v in self.items():
+            if v != other[n]:
+                return False
+        return True
+
+    def get_typed_entry(self,
+                        requested_classes: type(Self) | set[type(Self)],
+                        name: str,
+                        exist: bool = True):
+        print(f'{requested_classes=}')
+        requested_classes = make_set(requested_classes)
+        print(f'  changed to {requested_classes=}')
+        try:
+            v = self[name]
+        except:
+            if exist:
+                raise M5MetaError(f'"{name}" is not defined')
+            return None
+        print(f'  {v=}')
+        print(f'  {type(v)=}')
+        if not exist:
+            if type(v) in requested_classes:
+                raise M5MetaError(f'"{name}" is already defined as a {type(v)}')
+            raise M5MetaError(f'"{name}" is already defined, but not as any of {requested_classes}')
+        if type(v) not in requested_classes:
+            raise M5MetaError(f'"{name}" is not any of {requested_classes}')
+        return v
+
+    def get_all_typed_entries(self,
+                              requested_class: type(Self)):
+        for v in self.__data:
+            if isinstance(v, requested_class):
+                yield v
+
+    def set_attrs(self, attrs):
+        get_attrs(attrs, [])    # no defined attributes
+
+    def deep_equal(self, other):
+        if not self.__eq__(other):
+            return False
+        for n, v in self.items():
+            if (n not in other or
+                self[n] != other[n]):
+                return False
+        for n, v in other.items():
+            if n not in self:
+                return False
+        return True
+
+    def compute_width(self):
+        print(f'compute_width {self=}')
+        print(f'  {self.__data=}')
+        if self.width is not None:
+            return
+        self.width = 0
+        for n, c in self.__data.items():
+            print(f'computing width {n=} {c=}')
+            if c.origin is None:
+                c_origin = 0
+            else:
+                c_origin = c.origin
+            if c.width is None:
+                c.compute_width()
+            self.width = max(self.width, c_origin + c.width)
 
 
 @dataclass
 class M5Integer(M5Type):
-    pass
+    value:  TOptional[int] = None
+    signed: bool = False
+
+    def set_attrs(self, attrs):
+        print(f'set_attrs {attrs=}')
+        origin, width, default = get_attrs(attrs, ['origin', 'width', 'default'])
 
 
 @dataclass
-class M5EnumValue:
-    name:    str
-    value:   TOptional[int]
+class M5String(M5Type):
+    value:  TOptional[str] = None
 
 
 @dataclass
 class M5Enum(M5Type):
-    values:    Dict[str, M5EnumValue] = dict_field_no_init()
     max_value: int = 0
-    width:     TOptional[int] = None
 
     def define_value(self,
                      name: str,
                      value: TOptional[int] = None):
-        if name in self.values and self.values[name] is not None:
+        if name in self and self[name] is not None:
             raise M5MetaError(f'duplicate enum name {name}')
         if value is None:
-            value = self.max_value + 1
+            value = self.max_value
         if self.width is not None and value.bit_length() > self.width:
             raise M5MetaError(f'enum value {name}={value} wider than enum declared width {self.width}')
         self.max_value = max(value+1, self.max_value)
-        self.values[name] = M5EnumValue(name, value)
+        print(f'define_value: {name=} {value=}')
+        self[name] = M5Integer(name = name, value = value)
 
-    def assign_width(self):
-        if self.width is not None:
-            return
-        self.width = 0
-        for n, v in self.values.items():
-            self.width = max(self.width, v.value.bit_length())
+    def set_attrs(self, attrs):
+        width = get_attrs(attrs, ['width'])
 
-    def __eq__(self, other):
-        if (self.name != other.name or
-            self.max_value != other.max_value or
-            self.width != other.width or
-            len(self.values) != len(other.values)):
-            print(f'{self=}')
-            print(f'{other=}')
-            return False
-        for n, v in self.values.items():
-            if (n not in other.values or
-                self.values[n] != other.values[n]):
-                print(f'{self=}')
-                print(f'{other=}')
-                return False
-        return True
 
 
 @dataclass
 class M5Struct(M5Type):
     union:    bool = False
-    fields:   Dict[str, M5Type] = dict_field_no_init()
 
 
+# used for individual instructions as well as macros
 @dataclass
-class AddressSpace:
-    name:     str
-    width:    TOptional[int] = None
+class M5Instruction(M5Type):
+    pass
+
+
+# address space dict is empty
+@dataclass
+class M5AddressSpace(M5Type):
     depth:    TOptional[int] = None
     struct:   TOptional[M5Struct] = None
-    macros:   Dict[str, Dict] = dict_field_no_init()
     bits:     bytearray = dataclasses.field(default_factory = bytearray, init = False)
     pc:       int = dataclasses.field(default = 0, init = False)
-    inst:     Dict[int, dict] = dict_field_no_init()
-    data:     Dict[int, int] = dict_field_no_init()
+    inst:     dict[int, dict] = dict_field_no_init()
+    obj:      dict[int, int] = dict_field_no_init()
 
     def assign_bits(self, width, origin = None):
         if origin is None:
@@ -155,11 +280,12 @@ class AddressSpace:
 
     def instruction_to_object(self, addr, instruction):
         inst = 0
-        for fn, ft in self.struct.fields:
+        for fn, ft in self.struct:
+            print(f'instruction_to_object {fn=}, {ft=}')
             if fn in instruction:
                 fv = instruction[fn]
-            elif self.struct.fields[fn].default is not None:
-                fv = self.struct.fields[fn].default
+            elif ft.default is not None:
+                fv = ft.default
             else:
                 raise M5MetaError('unassigned field {fn} at address {addr:04x}')
             #fd.stats[fv] += 1
@@ -168,38 +294,20 @@ class AddressSpace:
 
     def generate_object(self):
         for addr, inst in self.inst.items():
-            self.data[addr] = self.instruction_to_object(addr, inst)
+            print(f'generate_object {addr=} {inst=}')
+            self.obj[addr] = self.instruction_to_object(addr, inst)
 
     def write_hex_file(self, fn):
         hex_digits = (self.width + 3)//4
         with open(fn, 'w') as f:
             prev_addr = -1
-            for addr in sorted(self.data.keys()):
+            for addr in sorted(self.obj.keys()):
                 if prev_addr is None or addr != prev_addr + 1:
                     print(f'@{addr:04x}', file = f)
-                data = self.data[addr]
+                d = self.obj[addr]
                 hex = '.format('
-                print(f'{data:0{hex_digits}x}', file = f)
+                print(f'{d:0{hex_digits}x}', file = f)
                 prev_addr = addr
-
-    def write_vhdl(self, f, name):
-        f.write('library ieee;\n')
-        f.write('use ieee.std_logic_1164.all;\n')
-        f.write('use ieee.numeric_std.all;\n')
-        f.write('\n')
-        f.write(f'package {name}_package is\n')
-        for fd in self.fields.values():
-            fd.write_vhdl(f)
-        f.write(f'  type {name}_t is\n')
-        f.write(f'    record\n')
-        for fd in self.fields.values():
-            f.write(f'      {fd.name}: {fd.name}_t;\n')
-        f.write(f'    end record;\n')
-        f.write(f'\n')
-        f.write(f'  type {name}_array_t is array (natural range <> of {name}_t;\n')
-        f.write(f'\n')
-
-        f.write(f'end package {name}_package;\n')
 
 
 class M5Meta:
@@ -210,10 +318,8 @@ class M5Meta:
 
         self.pass_num = 0
 
-        self.symtab = {}
-        self.spaces = {}
+        self.symtab = M5Type()
 
-        self.types = {}
         self.type_being_defined = None
         self.type_being_defined_stack = []
 
@@ -222,10 +328,6 @@ class M5Meta:
         self.anon_number = 0
 
         self.grammar = self.define_grammar()
-
-    def print_production(self, name, x):
-        if self.pass_num == 2:
-            print(f'{name}: {x}')
 
     def process_enum_value(self, d, value):
         if type(value) is int:
@@ -251,22 +353,12 @@ class M5Meta:
         return { 'origin': x[1] }
 
     def action_enum_item(self, x):
+        print(f'action_enum_item {x=}')
         if not hasattr(self, 'enum_being_defined'):
             self.enum_being_defined = M5Enum()
         name = x[0]
         value = x[1] if len(x) > 1 else None
         self.enum_being_defined.define_value(name, value)
-
-    def action_enum_width_attribute(self, x):
-        # XXX this now has to be done differently!
-        width = x[1]
-        if not hasattr(self, 'enum_being_defined'):
-            self.enum_being_defined = M5Enum()
-        if (self.enum_being_defined.width is not None and
-            width != self.enum_being_defined.width):
-            raise M5MetaError('multiple width attributes on enum')
-        self.enum_being_defined.width = width
-        return width
 
     def action_enum_def(self, x):
         name = x[1]
@@ -275,29 +367,33 @@ class M5Meta:
             #name = '___enum_' + str(self.anon_number)
             #self.anon_number += 1
         self.enum_being_defined.name = name
-        self.enum_being_defined.assign_width()
-        if name in self.types and self.enum_being_defined != self.types[name]:
+        print(f'action_enum_def {self.enum_being_defined}')
+        self.enum_being_defined.compute_width()
+        if name in self.symtab and self.enum_being_defined != self.symtab[name]:
             raise M5MetaError(f'type name "{name}" redefined')
-        self.types[name] = self.enum_being_defined
+        self.symtab[name] = self.enum_being_defined
         delattr(self, 'enum_being_defined')
 
     def action_type_integer(self, x):
         print(f'action_type_integer {x=}')
-
-    def action_type_enum(self, x):
-        print(f'action_type_enum {x=}')
-
-    def action_type_struct(self, x):
-        print(f'action_type_struct {x=}')
-
-    def action_type_named(self, x):
-        print(f'action_type_named {x=}')
+        t = M5Integer(signed = (x[0] == 'integer'))
+        return [t]
 
     def action_item_type(self, x):
         print(f'action_item_type {x=}')
 
     def action_item_named(self, x):
         print(f'action_item_named {x=}')
+        t, attrs, name = x
+        if isinstance(t, str):
+            t = copy.copy(self.symtab[t])  # shallow copy because we're likely to change some attributes
+            # XXX check for enum, struct
+        print(f'action_item_named {name=} {t=} {attrs=}')
+        t.set_attrs(attrs)
+        print(f'action_item_named: setting child "{name}" of {id(self.type_being_defined)}')
+        self.type_being_defined[name] = t
+        print(f'{self.type_being_defined=}')
+        return[t]
 
     def action_struct_or_union(self, x):
         print(f'action_struct_or_union {x=}')
@@ -305,6 +401,7 @@ class M5Meta:
             self.type_being_defined_stack.append(self.type_being_defined)
         self.type_being_defined = M5Struct(name = None,
                                            union = x[0] == 'union')
+        print(f'action_struct_or_union: created {id(self.type_being_defined)}')
 
     def action_struct_def(self, x):
         print(f'action_struct_def {x=}')
@@ -312,10 +409,12 @@ class M5Meta:
 
         # XXX should check for duplicate definition
         if name:
-            self.types[name] = self.type_being_defined
+            self.symtab[name] = self.type_being_defined
             result = name
         else:
             result = self.type_being_defined
+
+        print(f'action_struct_def done {id(self.type_being_defined)} {self.type_being_defined}')
 
         self.type_being_defined = None
         if len(self.type_being_defined_stack):
@@ -327,9 +426,11 @@ class M5Meta:
     def action_macro_def(self, x):
         name = x[1]
         inst = x[2]
-        if self.pass_num == 1 and name in self.space.macros:
-            raise M5MetaError(f'multiply defined macro {name} in address space {space_name}')
-        self.space.macros[name] = inst
+        if self.pass_num == 1:
+            self.symtab.get_typed_entry(M5Instruction, name, False)  # make sure no macro of this name already exists
+        else:
+            self.symtab.get_typed_entry(M5Instruction, name)  # make sure it exists
+            self.symtab[name] = inst              # replace, because it may have contained forward reference
 
     def eval_symbol(self, s, field_name):
         field = self.space.fields[field_name]
@@ -343,31 +444,38 @@ class M5Meta:
         return 0
 
     def action_instruction(self, x):
-        fd = { }
-        for fa in x:
-            if type(fa) is str:
+        print(f'action_instruction {x=}')
+        inst = M5Instruction()
+        for part in x:
+            name = part[0]
+            if len(part) == 1:
                 # macro invocation
-                if self.space is None:
-                    raise M5MetaError(f'undefined space, so no macro {fa}')
-                if fa not in self.space.macros:
-                    raise M5MetaError(f'undefined macro {fa}')
-                #for mfn, mfv in self.space.macros[fa].items():
-                #    self.add_field(fd, mfn, mfv)
-            else:
+                macro = self.symtab.get_typed_entry(M5Instruction, name)
+                for fn, fv in t:
+                    inst[fn] = fv
+            elif len(part) == 2:
                 # field assignment
-                #self.add_field(fd, fa[0], fa[1])
-                pass
-        return [fd]
+                struct_elem = self.space.struct.get_typed_entry(M5Integer, name)  # XXX need to handle other types
+                value = part[1]
+                if isinstance(value, int):
+                    value = M5Integer(value = part[1])
+                elif isinstance(part[1], str):
+                    value = self.symtab.get_typed_entry(M5Integer, name)
+                else:
+                    M5MetaError(f'cannot resolve field "{value}"')
+                inst[name] = value
+        return [inst]
 
     def action_l_instruction(self, x):
         while type(x[0]) is str:
             label = x[0]
             x = x[1:]
             if label in self.symtab:
-                if self.space.pc != self.symtab[label]:
-                    raise M5MetaError(f'multiply defined symbol "{label}", original value {self.symtab[label]:04x}, new value {self.pc:04x}')
+                ov = self.symtab.get_typed_entry(M5Integer, label).value
+                if self.space.pc != ov:
+                    raise M5MetaError(f'multiply defined symbol "{label}", original value {ov:04x}, new value {self.space.pc:04x}')
             else:
-                self.symtab[label] = self.space.pc
+                self.symtab[label] = M5Integer(value = self.space.pc)
         if self.pass_num == 2:
             fields = x[0]
             if self.space.pc in self.space.inst:
@@ -376,21 +484,17 @@ class M5Meta:
         self.space.pc += 1
 
     def action_origin_statement(self, x):
-        self.space.pc = x[1]
+        v = x[1]
+        self.space.pc = v
 
-    @staticmethod
-    def get_attrs(attrs, attr_names):
-        results = []
-        for n in attr_names:
-            try:
-                results.append(attrs[n])
-            except:
-                raise M5MetaError(f'missing required attribute {n}')
-        for n in attrs.keys():
-            if n not in attr_names:
-                raise M5MetaError(f'inappropriate attribute {n}')
-        return results
+    def action_equate_statement(self, x):
+        print(f'action_equate_statement {x=}')
+        name, _, value = x
+        if self.pass_num == 1:
+            self.symtab.get_typed_entry(M5Integer, name, False)  # make sure it doesn't already exist
+            self.symtab[name] = M5Integer(value = value)
         
+
     def action_space_def(self, x):
         attrs = x[1]
         struct = x[2]
@@ -398,34 +502,23 @@ class M5Meta:
         print(f'action_space_def {attrs=}')
         print(f'action_space_def {struct=}')
         print(f'action_space_def {name=}')
-        width, depth = self.get_attrs(attrs, ['width', 'depth'])
+        width, depth = get_attrs(attrs, ['width', 'depth'])
         if isinstance(struct, str):
-            try:
-                struct = self.types[struct]
-            except:
-                raise M5MetaError(f'type "{struct}" is undefined')
+            a = self.symtab.get_typed_entry(M5Struct, struct)  # make sure struct exists
         if self.pass_num == 1:
-            if name in self.spaces:
-                raise M5MetaError(f'multiply defined address space "{name}"')
-            self.spaces[name] = AddressSpace(name, width, depth, struct)
+            self.symtab.get_typed_entry(M5AddressSpace, name, exist = False)  # address space must not have been previously defined
+            self.symtab[name] = M5AddressSpace(name = name,
+                                               width = width,
+                                               depth = depth,
+                                               struct = struct)
         else:
-            if name not in self.spaces:
-                raise M5MetaError(f'undefined address space "{name}"')
+            a = self.symtab.get_typed_entry(M5AddressSpace, name)
             # XXX compare address space
 
     def action_space_ident(self, x):
         print(f'action_space_content {x=}')
         name = x[1]
-        try:
-            self.space = self.spaces[name]
-        except:
-            raise M5MetaError(f'undefined address space "{name}"')
-
-    def action_merge_dicts(self, x):
-        r = { }
-        for d in x:
-            r.update(d)  # XXX doesn't complain about duplicates
-        return r
+        self.space = self.symtab.get_typed_entry(M5AddressSpace, name)
 
     def define_grammar(self):
         dec_int = Word(nums).set_parse_action(lambda toks: int(toks[0]))
@@ -505,7 +598,7 @@ class M5Meta:
         attributes = LPAREN + separated_list(attribute,
                                              COMMA,
                                              allow_term_sep = False) + RPAREN
-        attributes.set_parse_action(self.action_merge_dicts)
+        attributes.set_parse_action(merge_dicts)
 
         enum_item = ident + Optional(EQUALS + value)
         enum_item.set_parse_action(self.action_enum_item)
@@ -555,6 +648,7 @@ class M5Meta:
         space_def.set_parse_action(self.action_space_def)
 
         equate_statement = ident + EQUATE + value
+        equate_statement.set_parse_action(self.action_equate_statement)
 
         origin_statement = ORIGIN + value
         origin_statement.set_parse_action(self.action_origin_statement)
@@ -574,7 +668,7 @@ class M5Meta:
 
         space_content = space_ident + space_statements
 
-        def_statement = space_def | enum_def | struct_def | macro_def | space_content
+        def_statement = equate_statement | space_def | enum_def | struct_def | macro_def | space_content
 
         def_statement_list = separated_list(def_statement, ';', allow_term_sep = True)
 
@@ -582,8 +676,6 @@ class M5Meta:
 
         compilation_unit = def_statement_list
         compilation_unit.ignore(comment)
-
-        #field_def.set_parse_action(partial(self.print_production, 'field_def'))
 
         return compilation_unit
 
@@ -606,14 +698,22 @@ class M5Meta:
                         vstr = ' (' + vstr + ')'
                 print(f'  value {value}{vstr}: {count}', file = self.listing_file)
 
+    def write_symtab(self):
+        for k, v in self.symtab:
+            print(f'{k:12s} {v}')
+
 
     def pass12(self):
         result = self.grammar.parseString(self.src, parseAll = True)
 
     def pass3(self):
-        for name, space in self.spaces.items():
+        for space in self.symtab.get_all_typed_entries(M5AddressSpace):
+            print(f'outputting object for address space {space.name}')
             space.generate_object()
             space.write_hex_file(self.obj_base_fn + '_' + space.name + '.hex')
+
+            self.write_symtab()
+
             if False:
                 with open(self.obj_base_fn + '_' + space.name + '.vhdl', 'w') as f:
                     space.write_vhdl(f, name)
