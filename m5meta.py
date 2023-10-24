@@ -164,21 +164,43 @@ class M5Type:
                 return False
         return True
 
+    def print(self,
+              indent: int = 0,
+              recurse: bool = True,
+              file: TextIO = sys.stdout,
+              root: Self = None):
+        if root is None:
+            root = self
+        print(f'{" "*indent} {type(self).__name__} (', file = file, end = '')
+        comma = ''
+        for f in dataclasses.fields(self):
+            fn = f.name
+            fv = getattr(self, fn)
+            print(f'{comma}{fn}={fv}', file = file, end = '')
+            comma = ', '
+        print(')', file = file)
+        if recurse:
+            for k, v in self.__data.items():
+                if (v.name is not None and
+                    root is not None and
+                    root is not self and
+                    v.name in root and
+                    v is root[v.name]):
+                    continue
+                print(f'{" "*(indent+2)} {k}', file = file, end = '')
+                v.print(indent+2, recurse, file, root)
+
     def get_typed_entry(self,
                         requested_classes: type(Self) | set[type(Self)],
                         name: str,
                         exist: bool = True):
-        print(f'{requested_classes=}')
         requested_classes = make_set(requested_classes)
-        print(f'  changed to {requested_classes=}')
         try:
             v = self[name]
         except:
             if exist:
                 raise M5MetaError(f'"{name}" is not defined')
             return None
-        print(f'  {v=}')
-        print(f'  {type(v)=}')
         if not exist:
             if type(v) in requested_classes:
                 raise M5MetaError(f'"{name}" is already defined as a {type(v)}')
@@ -209,20 +231,22 @@ class M5Type:
         return True
 
     def compute_width(self):
-        print(f'compute_width {self=}')
-        print(f'  {self.__data=}')
-        if self.width is not None:
-            return
-        self.width = 0
+        width = 0
         for n, c in self.__data.items():
-            print(f'computing width {n=} {c=}')
             if c.origin is None:
                 c_origin = 0
             else:
                 c_origin = c.origin
             if c.width is None:
                 c.compute_width()
-            self.width = max(self.width, c_origin + c.width)
+                if c.width is None:
+                    raise M5MetaError(f'cannot determine width of "{c.name}"')
+            width = max(width, c_origin + c.width)
+        if self.width is None:
+            self.width = width
+        else:
+            if self.width < width:
+                raise M5MetaError(f'width attribute {self.width} less than computed minimum {width}')
 
 
 @dataclass
@@ -232,7 +256,25 @@ class M5Integer(M5Type):
 
     def set_attrs(self, attrs):
         print(f'set_attrs {attrs=}')
-        origin, width, default = get_attrs(attrs, ['origin', 'width', 'default'])
+        origin, width, default = get_attrs(attrs, ['origin', 'width', 'default'])  # XXX should only allow origin and default if this is a field in a struct
+
+    def compute_width(self):
+        print(f'M5Integer.compute_width(), {self=}')
+        if self.value is None:
+            return
+        if self.value < 0 and not self.signed:
+            raise M5MetaError(f'unsigned has negative value')
+        width = self.value.bit_length()
+        if self.signed:
+            self.width += 1
+        if self.width is None:
+            self.width = width
+        elif self.width < width:
+            raise M5MetaError(f'width attribute {self.width} less than computed minimum {width}')
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.compute_width()
 
 
 @dataclass
@@ -255,11 +297,12 @@ class M5Enum(M5Type):
             raise M5MetaError(f'enum value {name}={value} wider than enum declared width {self.width}')
         self.max_value = max(value+1, self.max_value)
         print(f'define_value: {name=} {value=}')
-        self[name] = M5Integer(name = name, value = value)
+        self[name] = M5Integer(name = name, value = value, signed = value < 0)
 
     def set_attrs(self, attrs):
-        width = get_attrs(attrs, ['width'])
-
+        width = get_attrs(attrs, ['width'])[0]
+        if width is not None:
+            self.width = width
 
 
 @dataclass
@@ -282,6 +325,16 @@ class M5AddressSpace(M5Type):
     pc:       int = dataclasses.field(default = 0, init = False)
     inst:     dict[int, dict] = dict_field_no_init()
     obj:      dict[int, int] = dict_field_no_init()
+
+    def print(self,
+              indent: int = 0,
+              recurse: bool = True,
+              file: TextIO = sys.stdout,
+              root: Self = None):
+        super().print(indent, recurse, file, root)
+        if self.struct is None or isinstance(self.struct, str):
+            return
+        self.struct.print(indent+2, recurse, file, root)
 
     def assign_bits(self, width, origin = None):
         if origin is None:
@@ -345,6 +398,15 @@ class M5Meta:
 
         self.grammar = self.define_grammar()
 
+    def get_symbol(self, name):
+        if name in self.symtab:
+            return self.symtab[name]
+        if (self.space is not None and
+            isinstance(self.space.struct, M5Struct) and
+            name in self.space.struct):
+            return self.space.struct[name]
+        raise M5MetaError(f'undefined symbol "{name}"')
+
     def process_enum_value(self, d, value):
         if type(value) is int:
             return value
@@ -377,14 +439,18 @@ class M5Meta:
         self.enum_being_defined.define_value(name, value)
 
     def action_enum_def(self, x):
+        print(f'action_enum_def {x=}')
         name = x[1]
+        attrs = x[2]
         if name is None:
             raise M5MetaError('anonymous enum definition not embedded')
             #name = '___enum_' + str(self.anon_number)
             #self.anon_number += 1
         self.enum_being_defined.name = name
+        self.enum_being_defined.set_attrs(attrs)
         print(f'action_enum_def {self.enum_being_defined}')
         self.enum_being_defined.compute_width()
+        print(f'action_enum_def {self.enum_being_defined}')
         if name in self.symtab and self.enum_being_defined != self.symtab[name]:
             raise M5MetaError(f'type name "{name}" redefined')
         self.symtab[name] = self.enum_being_defined
@@ -471,8 +537,9 @@ class M5Meta:
                     inst[fn] = fv
             elif len(part) == 2:
                 # field assignment
-                struct_elem = self.space.struct.get_typed_entry(M5Integer, name)  # XXX need to handle other types
                 value = part[1]
+                print(f'field assignment {name=} {value=}')
+                struct_elem = self.space.struct.get_typed_entry(M5Integer, name)  # XXX need to handle other types
                 if isinstance(value, int):
                     value = M5Integer(value = part[1])
                 elif isinstance(part[1], str):
@@ -715,8 +782,9 @@ class M5Meta:
                 print(f'  value {value}{vstr}: {count}', file = self.listing_file)
 
     def write_symtab(self):
-        for k, v in self.symtab:
-            print(f'{k:12s} {v}')
+        self.symtab.print(root = self.symtab)
+        #for k, v in self.symtab:
+        #    print(f'{k:12s} {v}')
 
 
     def pass12(self):
@@ -751,6 +819,7 @@ class M5Meta:
                 self.passes[p](self)
         except M5MetaError as e:
             print(f'Error: {e}')
+            self.write_symtab()
             return
         if listf is not None:
             self.write_listing_file()
