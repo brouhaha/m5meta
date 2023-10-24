@@ -1,8 +1,10 @@
 #!/usr/bin/python3
 
 # m5meta: Meta assembler
-# Copyright 2023 Eric Smith <spacewar@gmail.com>
-# SPDX-License-Identifier: GPL-3.0
+__version__ = '2.0.0'
+__copyright__ = 'Copyright 2019-2023 Eric Smith'
+# SPDX-License-Identifier: GPL-3.0-only
+__license__ = 'GPL 3.0 only'
 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of version 3 of the GNU General Public License
@@ -16,12 +18,20 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-# Python 3.11 is required
+__author__ = 'Eric Smith'
+__email__ = 'spacewar@gmail.com'
+__description__ = 'M5 Meta Assembler'
+__url__ = 'https://github.com/brouhaha/m5meta',
 
-__version__ = '1.0.4'
-__author__ = 'Eric Smith <spacewar@gmail.com>'
 
-__all__ = ['__version__', '__author__',
+import sys
+__min_python_version__ = '3.11'
+if sys.version_info < tuple([int(n) for n in __min_python_version__.split('.')]):
+    sys.exit("Python version %s or later is required.\n" % __min_python_version__)
+
+
+__all__ = ['__version__', '__copyright__', '__author__', '__email__',
+           '__license__', '__description__', '__url__',
            'M5Meta', 'M5MetaError']
 
 import argparse
@@ -30,15 +40,16 @@ import dataclasses
 from dataclasses import dataclass
 from functools import partial
 import json
-import sys
-from typing import (Optional as TOptional,   # Optional conflicts with pyparsing
+from typing import (Optional as TOptional,       # typing.Optional conflicts with pyparsing.Optional
                     Self,
                     TextIO)
 
 import pyparsing
-from pyparsing import alphas, alphanums, \
-    delimitedList, nums, restOfLine, \
-    Forward, Keyword, Literal, Optional, Regex, Word, ZeroOrMore
+from pyparsing import (alphas, alphanums,
+                       delimitedList, nums, restOfLine,
+                       Forward, Keyword, Literal,
+                       Optional as POptional,    # pyparsing.Optional conflicts with typing.Optional,
+                       Regex, Word, ZeroOrMore)
 
 from m5pre import M5Pre
 
@@ -67,7 +78,7 @@ def separated_list(base, separator, allow_term_sep = False):
     if allow_term_sep:
         if type(separator) == str:
             separator = Literal(separator)
-        l += Optional(separator.suppress())
+        l += POptional(separator.suppress())
     return l
 
 def literal_suppress(s: str):
@@ -102,6 +113,11 @@ class M5MetaError(Exception):
     pass
 
 
+# Making a dataclass a subclass of dict or collections.UserDict
+# seems to cause mysterious problems; the data dictionary ends
+# up containing an element { dict: None }, and if deleted, it
+# just comes back. So instead, do some of the equivalent of
+# UserClass here.
 @dataclass
 class M5Type:
     # these are not applicable for symbol table root
@@ -587,7 +603,7 @@ class M5Meta:
         default_attribute.set_parse_action(self.action_default_attribute)
         
         width_attribute = WIDTH + value
-#        width_attribute = Optional(WIDTH, None) + value
+#        width_attribute = POptional(WIDTH, None) + value
         width_attribute.set_parse_action(self.action_width_attribute)
 
         origin_attribute = ORIGIN + value
@@ -600,20 +616,20 @@ class M5Meta:
                                              allow_term_sep = False) + RPAREN
         attributes.set_parse_action(merge_dicts)
 
-        enum_item = ident + Optional(EQUALS + value)
+        enum_item = ident + POptional(EQUALS + value)
         enum_item.set_parse_action(self.action_enum_item)
 
         enum_item_list = LBRACE + separated_list(enum_item,
                                                  SEMI,
                                                  allow_term_sep = True) + RBRACE
 
-        enum_def = ENUM + Optional(ident, None) + Optional(attributes, None) + enum_item_list
+        enum_def = ENUM + POptional(ident, None) + POptional(attributes, None) + enum_item_list
         enum_def.set_parse_action(self.action_enum_def)
 
 
         signed_integer_type = INTEGER
 
-        unsigned_integer_type = UNSIGNED + Optional(INTEGER)
+        unsigned_integer_type = UNSIGNED + POptional(INTEGER)
 
         integer_type = signed_integer_type | unsigned_integer_type
 
@@ -631,7 +647,7 @@ class M5Meta:
         item_type = type_integer | type_enum | type_struct | type_named
         item_type.set_parse_action(self.action_item_type)
 
-        item_named = item_type + Optional(attributes, None) + ident
+        item_named = item_type + POptional(attributes, None) + ident
         item_named.set_parse_action(self.action_item_named)
 
         item_list = LBRACE + separated_list(item_named,
@@ -641,10 +657,10 @@ class M5Meta:
         struct_or_union = ( STRUCT | UNION )
         struct_or_union.set_parse_action(self.action_struct_or_union)
 
-        struct_def = struct_or_union + Optional(ident, None) + Optional(attributes, None) + item_list
+        struct_def = struct_or_union + POptional(ident, None) + POptional(attributes, None) + item_list
         struct_def.set_parse_action(self.action_struct_def)
 
-        space_def = SPACE + Optional(attributes, None) + (struct_def | ident) + ident
+        space_def = SPACE + POptional(attributes, None) + (struct_def | ident) + ident
         space_def.set_parse_action(self.action_space_def)
 
         equate_statement = ident + EQUATE + value
@@ -672,7 +688,7 @@ class M5Meta:
 
         def_statement_list = separated_list(def_statement, ';', allow_term_sep = True)
 
-        comment = Literal('//') + Optional(restOfLine)
+        comment = Literal('//') + POptional(restOfLine)
 
         compilation_unit = def_statement_list
         compilation_unit.ignore(comment)
