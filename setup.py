@@ -20,7 +20,6 @@ classifiers = (python_classifiers(m5meta.__min_python_version__) +
                    'Development Status :: 4 - Beta',
                    'Environment :: Console',
                    'Intended Audience :: Developers',
-                   'Intended Audience :: Information Technology',
                    'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
                    'Operating System :: OS Independent',
                    'Topic :: Software Development :: Assemblers',
