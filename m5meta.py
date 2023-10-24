@@ -98,7 +98,6 @@ def dict_field_no_init(repr = True):
 def get_attrs(attrs, attr_names):
     if attrs is None:
         attrs = { }
-    print(f'get_attrs {attrs=} {attr_names=}')
     results = [None] * len(attr_names)
     for i in range(len(attr_names)):
         if attr_names[i] in attrs:
@@ -118,12 +117,14 @@ class M5MetaError(Exception):
 # up containing an element { dict: None }, and if deleted, it
 # just comes back. So instead, do some of the equivalent of
 # UserClass here.
+# Only the symbol table is a bare M5Type. All others are
+# subclasses.
 @dataclass
 class M5Type:
     # these are not applicable for symbol table root
-    name:     TOptional[str] = None  
+    name:     TOptional[str] = None
     width:    TOptional[int] = None
-    origin:   TOptional[int] = None
+    origin:   TOptional[int] = None  # relative to origin of parent
 
     def __post_init__(self):
         self.__data = {}
@@ -138,6 +139,9 @@ class M5Type:
 
     def __setitem__(self, key, item):
         self.__data[key] = item
+        # WARNING: special-case behavior not like a normal dictionary
+        # insert into child a reference to the parent
+        item.parent = self
 
     def __delitem__(self, key):
         del self.__data[key]
@@ -168,27 +172,38 @@ class M5Type:
               indent: int = 0,
               recurse: bool = True,
               file: TextIO = sys.stdout,
-              root: Self = None):
-        if root is None:
+              root: Self = None,
+              name_in_parent: str = None):
+        if (root is None or
+            root is self):
             root = self
-        print(f'{" "*indent} {type(self).__name__} (', file = file, end = '')
-        comma = ''
-        for f in dataclasses.fields(self):
-            fn = f.name
-            fv = getattr(self, fn)
-            print(f'{comma}{fn}={fv}', file = file, end = '')
-            comma = ', '
-        print(')', file = file)
+            print('symbol table:', file = file)
+        else:
+            if name_in_parent is None:
+                name_in_parent = '<anon>'
+            print(f'{" "*indent}{name_in_parent}: {type(self).__name__} (', file = file, end = '')
+            comma = ''
+            for f in dataclasses.fields(self):
+                fn = f.name
+                fv = getattr(self, fn)
+                print(f'{comma}{fn}={fv}', file = file, end = '')
+                comma = ', '
+            print(')', file = file)
         if recurse:
             for k, v in self.__data.items():
-                if (v.name is not None and
-                    root is not None and
-                    root is not self and
-                    v.name in root and
-                    v is root[v.name]):
-                    continue
-                print(f'{" "*(indent+2)} {k}', file = file, end = '')
-                v.print(indent+2, recurse, file, root)
+                do_recurse = (recurse and
+                              ((self is root) or
+                               (v.name not in root) or
+                               (v != root[v.name])))
+                #print(f'{" "*(indent+2)} {k}', file = file, end = '')
+                if do_recurse:
+                    v.print(indent = indent+2,
+                            recurse = do_recurse,
+                            file = file,
+                            root = root,
+                            name_in_parent = k)
+                else:
+                    print(file = file)
 
     def get_typed_entry(self,
                         requested_classes: type(Self) | set[type(Self)],
@@ -330,11 +345,20 @@ class M5AddressSpace(M5Type):
               indent: int = 0,
               recurse: bool = True,
               file: TextIO = sys.stdout,
-              root: Self = None):
-        super().print(indent, recurse, file, root)
+              root: Self = None,
+              name_in_parent: str = None):
+        super().print(indent = indent,
+                      recurse = recurse,
+                      file = file,
+                      root = root,
+                      name_in_parent = name_in_parent)
         if self.struct is None or isinstance(self.struct, str):
             return
-        self.struct.print(indent+2, recurse, file, root)
+        self.struct.print(indent = indent+2,
+                          recurse = recurse,
+                          file = file,
+                          root = root,
+                          name_in_parent = None)
 
     def assign_bits(self, width, origin = None):
         if origin is None:
@@ -489,12 +513,14 @@ class M5Meta:
         print(f'action_struct_def {x=}')
         name = x[1]
 
-        # XXX should check for duplicate definition
-        if name:
+        if name is None:
+            print(f'action_struct_def: no name')
+            result = self.type_being_defined
+        else:
+            # XXX should check for duplicate definition
+            self.type_being_defined.name = name
             self.symtab[name] = self.type_being_defined
             result = name
-        else:
-            result = self.type_being_defined
 
         print(f'action_struct_def done {id(self.type_being_defined)} {self.type_being_defined}')
 
@@ -796,7 +822,7 @@ class M5Meta:
             space.generate_object()
             space.write_hex_file(self.obj_base_fn + '_' + space.name + '.hex')
 
-            self.write_symtab()
+            #self.write_symtab()
 
             if False:
                 with open(self.obj_base_fn + '_' + space.name + '.vhdl', 'w') as f:
@@ -823,6 +849,7 @@ class M5Meta:
             return
         if listf is not None:
             self.write_listing_file()
+        self.write_symtab()
 
 
 def main():
